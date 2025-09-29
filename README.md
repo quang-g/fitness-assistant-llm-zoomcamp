@@ -41,6 +41,27 @@ pipenv run jupyter notebook
 ```
 ## Evaluation
 
+The basic approach using Minsearch without using any boosting - gave the following results:
+
+* hit_rate: 63%
+* MRR: 58%
+
+After tuning the parameters, the result is:
+
+* hit_rate: 68%
+* MRR: 62%
+
+The best parameters are:
+{
+'exercise_name': 2.5,
+'type_of_activity': 1.4,
+'type_of_equipment': 2.2,
+'body_part': 0.5,
+'type': 2.5,
+'muscle_groups_activated': 0.06,
+'instruction': 0.5
+}
+
 ### Retrieval
 
 ### RAG Flow

@@ -15,6 +15,7 @@ minsearch = "*"
 tqdm = "*"
 notebook = "*"
 ipywidgets = "*"
+hyperopt = "*"
 
 [requires]
 python_version = "3.12"
