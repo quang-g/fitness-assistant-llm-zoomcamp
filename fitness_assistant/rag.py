@@ -303,6 +303,43 @@ class FitnessRAGPipeline:
         return self._openai_client
 
 
+_PIPELINE: Optional[FitnessRAGPipeline] = None
+
+
+def get_pipeline(**kwargs: Any) -> FitnessRAGPipeline:
+    """
+    Return a module-level singleton pipeline, optionally configuring it on first use.
+
+    Subsequent calls ignore kwargs; create a new pipeline manually if you need different
+    parameters.
+    """
+    global _PIPELINE
+    if _PIPELINE is None:
+        _PIPELINE = FitnessRAGPipeline(**kwargs)
+    return _PIPELINE
+
+
+def rag(
+    question: str,
+    *,
+    size: Optional[int] = None,
+    filters: Optional[Dict[str, Any]] = None,
+    params_override: Optional[Dict[str, float]] = None,
+    skip_llm: bool = False,
+) -> Dict[str, Any]:
+    """
+    Convenience wrapper around :class:`FitnessRAGPipeline.answer` for simple scripts.
+    """
+    pipeline = get_pipeline()
+    return pipeline.answer(
+        question,
+        size=size,
+        filters=filters,
+        params_override=params_override,
+        skip_llm=skip_llm,
+    )
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
 
