@@ -7,9 +7,12 @@ name = "pypi"
 openai = "*"
 scikit-learn = "*"
 pandas = "*"
-flask = "*"
 google-genai = "*"
 minsearch = "*"
+elasticsearch = "*"
+sentence-transformers = "*"
+flask = "*"
+psycopg2-binary = "*"
 
 [dev-packages]
 tqdm = "*"
