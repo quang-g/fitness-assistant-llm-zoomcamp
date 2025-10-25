@@ -13,6 +13,7 @@ elasticsearch = "*"
 sentence-transformers = "*"
 flask = "*"
 psycopg2-binary = "*"
+python-dotenv = "*"
 
 [dev-packages]
 tqdm = "*"
