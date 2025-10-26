@@ -1,16 +1,14 @@
 FROM python:3.12
-
 WORKDIR /app
 
 RUN pip install pipenv
 
-COPY data/data.csv data/data.csv
-COPY ["Pipfile", "Pipfile.lock", "./"]
-
+COPY Pipfile Pipfile.lock ./
 RUN pipenv install --deploy --ignore-pipfile --system
 
-COPY fitness_assistant .
+COPY fitness_assistant /app/fitness_assistant
+COPY data/fitness_exercises_500.csv data/fitness_exercises_500.csv
 
 EXPOSE 5000
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "fitness_assistant.app:app"]
 
-CMD gunicorn --bind 0.0.0.0:5000 app:app

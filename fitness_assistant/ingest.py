@@ -1,22 +1,27 @@
 """Ingest the fitness exercise dataset into Elasticsearch with vector embeddings."""
 
-from __future__ import annotations
+from __future__ import annotations  # must come first
 
+# stdlib
 import argparse
 import logging
+import os
 from pathlib import Path
 from typing import Iterable, List, Mapping, Sequence
 
+# third-party
 import pandas as pd
 from elasticsearch import Elasticsearch, helpers
 from sentence_transformers import SentenceTransformer
 from tqdm.auto import tqdm
 
+
 # Default configuration pulled from the exploratory ingestion notebook.
 DEFAULT_MODEL_NAME = "multi-qa-MiniLM-L6-cos-v1"
 DEFAULT_INDEX_NAME = "500_fitness_exercises"
-DEFAULT_ES_URL = "http://localhost:9200"
+DEFAULT_ES_URL = os.getenv("ES_URL", "http://localhost:9200")
 EMBED_DIMENSIONS = 384
+DATA_PATH = os.getenv("DATA_PATH", "../data/fitness_exercises_500.csv")
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--csv-path",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "data" / "fitness_exercises_500.csv",
+        default=Path(DATA_PATH),
         help="Path to the CSV containing the exercises.",
     )
     parser.add_argument(

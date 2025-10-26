@@ -9,9 +9,7 @@ utility class and CLI for:
 * constructing an instruction-focused prompt; and
 * generating an answer with OpenAI's GPT models.
 """
-
 from __future__ import annotations
-
 import argparse
 import logging
 import os
@@ -20,7 +18,6 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from elasticsearch import Elasticsearch
 from sentence_transformers import SentenceTransformer
-
 from fitness_assistant.ingest import (
     DEFAULT_ES_URL,
     DEFAULT_INDEX_NAME,
@@ -28,11 +25,11 @@ from fitness_assistant.ingest import (
     ingest as run_ingest,
 )
 
+# --- OpenAI client (replaces Google Gemini) -----------------------------------
 try:
     from openai import OpenAI
 except ImportError:  # pragma: no cover - handled at runtime
     OpenAI = None  # type: ignore
-
 
 # Tuned parameters discovered in `rag-test-es.py`.
 BEST_PARAMS: Dict[str, float] = {
@@ -52,7 +49,6 @@ BEST_PARAMS: Dict[str, float] = {
 
 PROMPT_TEMPLATE = """
 You're a professional fitness assistant. Answer the QUESTION based only on the CONTEXT provided from the exercise & fitness database.
-
 - Use only the facts from the CONTEXT when answering the QUESTION.
 - If the CONTEXT does not contain the answer, respond with: NONE.
 - Keep your answer clear, concise, and detailed with instructions for fitness use.
@@ -76,7 +72,6 @@ instruction: {instruction}
 
 class SentenceTransformerEmbedder:
     """Minimal wrapper so we can reuse the same model for query embeddings."""
-
     def __init__(self, model_name: str) -> None:
         self._model = SentenceTransformer(model_name)
 
@@ -86,7 +81,6 @@ class SentenceTransformerEmbedder:
 
 class FitnessRAGPipeline:
     """RAG helper that glues together ingestion, retrieval, and answer generation."""
-
     def __init__(
         self,
         *,
@@ -100,10 +94,12 @@ class FitnessRAGPipeline:
         self.index_name = index_name
         self.model_name = model_name
         self.llm_model = llm_model
-        self._logger = logging.getLogger(self.__class__.__name__)
 
+        self._logger = logging.getLogger(self.__class__.__name__)
         self.es = Elasticsearch(self.es_url)
         self.embedder = SentenceTransformerEmbedder(self.model_name)
+
+        # OpenAI client handle
         self._openai_client = openai_client
 
     # --------------------------------------------------------------------- #
@@ -141,7 +137,6 @@ class FitnessRAGPipeline:
     ) -> List[Dict[str, Any]]:
         """
         Run a hybrid (keyword + kNN) search with tuned defaults.
-
         ``params_override`` can override any of the keys found in ``BEST_PARAMS``.
         """
         params = dict(BEST_PARAMS)
@@ -152,7 +147,6 @@ class FitnessRAGPipeline:
 
         vector = self.embedder.embed_query(query)
         es_bool_filter = self._normalize_filters(filters)
-
         fields = [
             f"exercise_name^{params['b_exercise_name']}",
             f"muscle_groups_activated^{params['b_muscle_groups']}",
@@ -162,7 +156,6 @@ class FitnessRAGPipeline:
             f"type^{params['b_type']}",
             f"instruction^{params['b_instruction']}",
         ]
-
         body: Dict[str, Any] = {
             "query": {
                 "bool": {
@@ -193,7 +186,6 @@ class FitnessRAGPipeline:
         self._logger.debug("Hybrid query body: %s", body)
         res = self.es.search(index=self.index_name, body=body)
         hits = res.get("hits", {}).get("hits", [])
-
         formatted: List[Dict[str, Any]] = []
         for hit in hits:
             src = hit.get("_source", {})
@@ -209,7 +201,6 @@ class FitnessRAGPipeline:
                     "instruction": src.get("instruction", ""),
                 }
             )
-
         return formatted
 
     @staticmethod
@@ -238,7 +229,7 @@ class FitnessRAGPipeline:
         return PROMPT_TEMPLATE.format(question=question, context=context).strip()
 
     # --------------------------------------------------------------------- #
-    # LLM interaction
+    # LLM interaction (OpenAI)
     # --------------------------------------------------------------------- #
     def answer(
         self,
@@ -251,7 +242,6 @@ class FitnessRAGPipeline:
     ) -> Dict[str, Any]:
         """
         Run retrieval (and optionally the LLM) returning answer + supporting context.
-
         Returns a dict containing ``question``, ``context``, ``documents`` and,
         when ``skip_llm`` is False, the generated ``answer``.
         """
@@ -267,32 +257,29 @@ class FitnessRAGPipeline:
             "context": context,
             "documents": documents,
         }
-
         if skip_llm:
             return result
 
         client = self._ensure_openai_client()
         prompt = self.build_prompt(question, documents)
-        response = client.responses.create(
+
+        # Using Chat Completions for wide compatibility with gpt-4.1-mini
+        resp = client.chat.completions.create(
             model=self.llm_model,
-            input=prompt,
+            messages=[
+                {"role": "system", "content": "You are a professional fitness assistant. Follow instructions exactly."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
         )
-        text = getattr(response, "output_text", "")
-        if not text and hasattr(response, "output"):  # pragma: no cover - safety net
-            fragments: List[str] = []
-            for item in getattr(response, "output", []):
-                for piece in getattr(item, "content", []):
-                    if getattr(piece, "type", "") == "output_text":
-                        fragments.append(getattr(piece, "text", ""))
-            text = "".join(fragments)
-        result["answer"] = text.strip()
+        answer_text = (resp.choices[0].message.content or "").strip()
+        result["answer"] = answer_text
         return result
 
     def _ensure_openai_client(self) -> "OpenAI":
-
         if OpenAI is None:  # pragma: no cover - runtime safeguard
             raise RuntimeError(
-                "openai package is not installed. Install the dependency or run with --no-llm."
+                "openai is not installed. Install it with: pip install --upgrade openai"
             )
         if not os.environ.get("OPENAI_API_KEY"):
             raise RuntimeError(
@@ -302,14 +289,10 @@ class FitnessRAGPipeline:
             self._openai_client = OpenAI()
         return self._openai_client
 
-
 _PIPELINE: Optional[FitnessRAGPipeline] = None
-
-
 def get_pipeline(**kwargs: Any) -> FitnessRAGPipeline:
     """
     Return a module-level singleton pipeline, optionally configuring it on first use.
-
     Subsequent calls ignore kwargs; create a new pipeline manually if you need different
     parameters.
     """
@@ -317,8 +300,6 @@ def get_pipeline(**kwargs: Any) -> FitnessRAGPipeline:
     if _PIPELINE is None:
         _PIPELINE = FitnessRAGPipeline(**kwargs)
     return _PIPELINE
-
-
 def rag(
     question: str,
     *,
@@ -339,10 +320,8 @@ def rag(
         skip_llm=skip_llm,
     )
 
-
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-
     parser.add_argument(
         "--question",
         "-q",
@@ -382,7 +361,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--llm-model",
         default="gpt-4.1-mini",
-        help="OpenAI model identifier to use when generating the answer.",
+        help="OpenAI model identifier to use when generating the answer (default: gpt-4.1-mini).",
     )
     parser.add_argument(
         "--batch-size",
@@ -406,13 +385,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Enable debug logging.",
     )
-
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
-
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -442,8 +419,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if args.no_llm:
         print(result["context"])
     else:
-        answer = result.get("answer", "")
-        print(answer)
+        print(result.get("answer", ""))
 
 
 if __name__ == "__main__":
