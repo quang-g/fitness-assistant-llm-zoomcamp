@@ -11,10 +11,12 @@ utility class and CLI for:
 """
 from __future__ import annotations
 import argparse
+import json
 import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
+from time import perf_counter
 
 from elasticsearch import Elasticsearch
 from sentence_transformers import SentenceTransformer
@@ -67,6 +69,26 @@ body_part: {body_part}
 type: {type}
 muscle_groups_activated: {muscle_groups_activated}
 instruction: {instruction}
+""".strip()
+
+EVALUATION_PROMPT_TEMPLATE = """
+You are an expert evaluator for a RAG system.
+Your task is to analyze the relevance of the generated answer to the given question.
+Based on the relevance of the generated answer, you will classify it
+as "NON_RELEVANT", "PARTLY_RELEVANT", or "RELEVANT".
+
+Here is the data for evaluation:
+
+Question: {question}
+Generated Answer: {answer}
+
+Please analyze the content and context of the generated answer in relation to the question
+and provide your evaluation in parsable JSON without using code blocks:
+
+{{
+  "Relevance": "NON_RELEVANT" | "PARTLY_RELEVANT" | "RELEVANT",
+  "Explanation": "[Provide a brief explanation for your evaluation]"
+}}
 """.strip()
 
 
@@ -257,13 +279,19 @@ class FitnessRAGPipeline:
             "context": context,
             "documents": documents,
         }
+
+        metadata = self._default_answer_metadata()
+        metadata["model_used"] = self.llm_model
+
         if skip_llm:
+            result.update(metadata)
             return result
 
         client = self._ensure_openai_client()
         prompt = self.build_prompt(question, documents)
 
         # Using Chat Completions for wide compatibility with gpt-4.1-mini
+        start_time = perf_counter()
         resp = client.chat.completions.create(
             model=self.llm_model,
             messages=[
@@ -272,8 +300,31 @@ class FitnessRAGPipeline:
             ],
             temperature=0.2,
         )
+        metadata["response_time"] = perf_counter() - start_time
+        metadata["model_used"] = getattr(resp, "model", self.llm_model) or self.llm_model
         answer_text = (resp.choices[0].message.content or "").strip()
         result["answer"] = answer_text
+        metadata["answer"] = answer_text
+
+        usage = getattr(resp, "usage", None)
+        metadata["prompt_tokens"] = getattr(usage, "prompt_tokens", 0) or 0
+        metadata["completion_tokens"] = getattr(usage, "completion_tokens", 0) or 0
+        metadata["total_tokens"] = getattr(usage, "total_tokens", 0) or (
+            metadata["prompt_tokens"] + metadata["completion_tokens"]
+        )
+        metadata["openai_cost"] = self._estimate_openai_cost(
+            metadata["model_used"],
+            metadata["prompt_tokens"],
+            metadata["completion_tokens"],
+        )
+        if answer_text:
+            eval_metadata = self._evaluate_answer_relevance(
+                client, question, answer_text
+            )
+            metadata["openai_cost"] += eval_metadata.pop("eval_openai_cost", 0.0)
+            metadata.update(eval_metadata)
+
+        result.update(metadata)
         return result
 
     def _ensure_openai_client(self) -> "OpenAI":
@@ -288,6 +339,110 @@ class FitnessRAGPipeline:
         if self._openai_client is None:
             self._openai_client = OpenAI()
         return self._openai_client
+
+    def _evaluate_answer_relevance(
+        self,
+        client: "OpenAI",
+        question: str,
+        answer: str,
+    ) -> Dict[str, Any]:
+        """
+        Use an auxiliary OpenAI call to classify answer relevance.
+        Returns metadata ready to merge into the result structure.
+        """
+        eval_model = os.getenv("OPENAI_EVAL_MODEL", "gpt-4o-mini")
+        prompt = EVALUATION_PROMPT_TEMPLATE.format(question=question, answer=answer)
+
+        try:
+            resp = client.chat.completions.create(
+                model=eval_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert evaluator for a RAG system.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self._logger.warning("Evaluation call failed: %s", exc)
+            return {
+                "relevance": "UNKNOWN",
+                "relevance_explanation": "Evaluation call failed.",
+                "eval_prompt_tokens": 0,
+                "eval_completion_tokens": 0,
+                "eval_total_tokens": 0,
+                "eval_openai_cost": 0.0,
+            }
+
+        raw_content = (resp.choices[0].message.content or "").strip()
+        raw_content = self._strip_code_fences(raw_content)
+        try:
+            parsed = json.loads(raw_content)
+        except json.JSONDecodeError:
+            parsed = {
+                "Relevance": "UNKNOWN",
+                "Explanation": "Failed to parse evaluation output.",
+            }
+
+        usage = getattr(resp, "usage", None)
+        eval_prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+        eval_completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+        eval_total_tokens = getattr(usage, "total_tokens", 0) or (
+            eval_prompt_tokens + eval_completion_tokens
+        )
+
+        return {
+            "relevance": parsed.get("Relevance", "UNKNOWN"),
+            "relevance_explanation": parsed.get(
+                "Explanation", "No explanation provided."
+            ),
+            "eval_prompt_tokens": eval_prompt_tokens,
+            "eval_completion_tokens": eval_completion_tokens,
+            "eval_total_tokens": eval_total_tokens,
+            "eval_openai_cost": self._estimate_openai_cost(
+                eval_model, eval_prompt_tokens, eval_completion_tokens
+            ),
+        }
+
+    @staticmethod
+    def _strip_code_fences(text: str) -> str:
+        if text.startswith("```"):
+            lines = [
+                line for line in text.splitlines() if not line.strip().startswith("```")
+            ]
+            return "\n".join(lines).strip()
+        return text
+
+    @staticmethod
+    def _default_answer_metadata() -> Dict[str, Any]:
+        """Return the default structure expected by persistence layers."""
+        return {
+            "answer": "",
+            "model_used": "",
+            "response_time": 0.0,
+            "relevance": "UNKNOWN",
+            "relevance_explanation": "Relevance evaluation not run.",
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "eval_prompt_tokens": 0,
+            "eval_completion_tokens": 0,
+            "eval_total_tokens": 0,
+            "openai_cost": 0.0,
+        }
+
+    @staticmethod
+    def _estimate_openai_cost(model_name: str, prompt_tokens: int, completion_tokens: int) -> float:
+        """
+        Estimate the OpenAI cost for a call using optional environment overrides.
+        If no overrides are supplied this returns 0.0 to keep compatibility.
+        """
+        prompt_cost = float(os.getenv("OPENAI_PROMPT_COST_PER_1K", "0"))
+        completion_cost = float(os.getenv("OPENAI_COMPLETION_COST_PER_1K", "0"))
+
+        return (prompt_tokens / 1000.0) * prompt_cost + (completion_tokens / 1000.0) * completion_cost
 
 _PIPELINE: Optional[FitnessRAGPipeline] = None
 def get_pipeline(**kwargs: Any) -> FitnessRAGPipeline:
